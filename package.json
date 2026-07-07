@@ -1,0 +1,33 @@
+{
+  "name": "sendhiiv",
+  "version": "0.1.0",
+  "description": "Official Node.js SDK for the Sendhiiv email API — send transactional email with one call.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "sendhiiv",
+    "email",
+    "transactional",
+    "smtp",
+    "api",
+    "mail"
+  ],
+  "author": "Sendhiiv <support@sendhiiv.com>",
+  "license": "MIT",
+  "homepage": "https://sendhiiv.com/docs/api",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sendhiiv/sendhiiv-node"
+  }
+}
