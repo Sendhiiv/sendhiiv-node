@@ -88,6 +88,7 @@ A fuller example:
 
 ```js
 await sendhiiv.messages.send({
+  from: "Acme Billing <billing@yourdomain.com>",
   to: ["a@example.com", "b@example.com"],
   subject: "March invoice",
   templateKey: "brand-layout",
@@ -108,6 +109,7 @@ Drip mode spreads large recipient lists into scheduled batches:
 
 ```js
 await sendhiiv.messages.send({
+  from: "Acme <hello@yourdomain.com>",
   to: recipients,
   subject: "Product update",
   html,
@@ -178,6 +180,7 @@ app.post("/signup", async (req, res) => {
 
   try {
     await sendhiiv.messages.send({
+      from: "Acme <hello@yourdomain.com>",
       to: user.email,
       subject: "Welcome to Acme",
       templateKey: "welcome-email",
