@@ -28,6 +28,6 @@
   "homepage": "https://sendhiiv.com/docs/api",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/sendhiiv/sendhiiv-node.git"
+    "url": "git+https://github.com/Sendhiiv/sendhiiv-node.git"
   }
 }
