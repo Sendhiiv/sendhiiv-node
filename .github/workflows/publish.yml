@@ -1,0 +1,61 @@
+# Publishes to npm when main changes.
+#
+# No NPM_TOKEN is stored anywhere. npm accepts the publish on the strength of a
+# short-lived OIDC token from GitHub, checked against the trusted publisher
+# configured on npmjs.com for this package. That config names this file, so
+# renaming it breaks publishing until the config is updated to match.
+#
+# Publishing this way also attaches a provenance attestation automatically —
+# npm shows which repository, commit and workflow built the tarball.
+name: Publish to npm
+
+on:
+  push:
+    branches: [main]
+  # Lets you re-run a publish by hand without pushing anything.
+  workflow_dispatch:
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # required: this is what mints the OIDC token
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Trusted publishing needs npm >= 11.5.1, which ships with Node 24.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      # The package has no dependencies, so there is nothing to install and no
+      # lockfile for `npm ci` to read. Tests run straight off the checkout.
+      - name: Test
+        run: npm test
+
+      # npm rejects a republish of an existing version outright, so unlike the
+      # NuGet side there is no "skip duplicate" flag to lean on. Check first,
+      # and let an unchanged version pass quietly instead of failing the build.
+      - name: Is this version already on the registry?
+        id: check
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "sendhiiv@$VERSION" version > /dev/null 2>&1; then
+            echo "sendhiiv@$VERSION is already published — nothing to do."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "sendhiiv@$VERSION is new — publishing."
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # No NODE_AUTH_TOKEN: the npm CLI detects the OIDC environment itself.
+      - name: Publish
+        if: steps.check.outputs.publish == 'true'
+        run: npm publish
