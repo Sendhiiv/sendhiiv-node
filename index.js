@@ -90,31 +90,92 @@ class Sendhiiv {
     this.messages = {
       /**
        * Send a transactional email. Resolves with the queue confirmation
-       * (HTTP 202) or throws SendhiivError.
+       * (HTTP 202) — whose `data` array holds one `msg_…` id per recipient —
+       * or throws SendhiivError.
+       *
+       * Pass `idempotencyKey` to make a retry safe: if the request was already
+       * accepted, you get the original response back and nothing is sent again.
+       *
+       *   await sendhiiv.messages.send(message, { idempotencyKey: order.id });
        */
-      send: (message) => this.#request("POST", "/messages", message),
+      send: (message, options = {}) =>
+        this.#request("POST", "/messages", {
+          body: message,
+          headers: options.idempotencyKey
+            ? { "Idempotency-Key": String(options.idempotencyKey) }
+            : undefined,
+        }),
+
+      /**
+       * Current status of one message, by the id returned when it was sent.
+       * Use this to reconcile after a timeout or a missed webhook.
+       */
+      get: (id) =>
+        this.#request("GET", `/messages/${encodeURIComponent(id)}`),
+    };
+
+    this.suppressions = {
+      /** Addresses this account will not send to. */
+      list: (params = {}) => this.#request("GET", "/suppressions", { params }),
+
+      /** Suppress one address. */
+      add: (suppression) =>
+        this.#request("POST", "/suppressions", { body: suppression }),
+
+      /** Remove a suppression. Only `manual` and `invalid` entries can go. */
+      remove: (email) =>
+        this.#request(
+          "DELETE",
+          `/suppressions/${encodeURIComponent(email)}`,
+        ),
+
+      /**
+       * Bulk import, for moving a list off another provider.
+       *
+       *   await sendhiiv.suppressions.import({
+       *     reason: "bounce",
+       *     csv: fs.readFileSync("sendgrid-bounces.csv", "utf8"),
+       *   });
+       */
+      import: (payload) =>
+        this.#request("POST", "/suppressions/import", { body: payload }),
     };
   }
 
-  async #request(method, path, message) {
-    const payload = toWirePayload(message || {});
+  async #request(method, path, options = {}) {
+    const { body, headers: extraHeaders, params } = options;
+    const hasBody = body !== undefined;
+    const payload = hasBody ? toWirePayload(body) : null;
+    const query = params
+      ? Object.entries(params)
+          .filter(([, value]) => value !== undefined && value !== null)
+          .map(
+            ([key, value]) =>
+              `${encodeURIComponent(key)}=${encodeURIComponent(value)}`,
+          )
+          .join("&")
+      : "";
+    const url = this.baseUrl + path + (query ? `?${query}` : "");
 
     // Only 429 (rate limit) is retried: the limiter runs before anything is
     // queued, so a retry can never double-send. 5xx and network errors are
-    // NOT retried — the message may already have been accepted.
+    // NOT retried automatically — the message may already have been accepted.
+    // Retry those yourself if you passed an idempotencyKey, which makes the
+    // retry return the original response instead of sending again.
     for (let attempt = 0; ; attempt++) {
       let response;
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), this.timeoutMs);
       try {
-        response = await fetch(this.baseUrl + path, {
+        response = await fetch(url, {
           method,
           headers: {
             Authorization: `Bearer ${this.apiKey}`,
-            "Content-Type": "application/json",
-            "User-Agent": "sendhiiv-node/0.1.0",
+            "User-Agent": "sendhiiv-node/0.2.0",
+            ...(hasBody ? { "Content-Type": "application/json" } : {}),
+            ...(extraHeaders || {}),
           },
-          body: JSON.stringify(payload),
+          ...(hasBody ? { body: JSON.stringify(payload) } : {}),
           signal: controller.signal,
         });
       } catch (err) {

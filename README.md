@@ -38,11 +38,18 @@ The whole surface is two things:
 | `Sendhiiv` | The client. Create one and reuse it for the life of your process. |
 | `SendhiivError` | Thrown for any non-2xx response, network failure, or timeout. |
 
-The API currently has one endpoint (`POST /messages`), so
-`sendhiiv.messages.send(params)` is the only method you'll call. It returns a
-promise that resolves with the queue confirmation or rejects with a
-`SendhiivError`. When more endpoints ship they'll appear as new resources on
-the client (`sendhiiv.domains`, etc.).
+Methods are grouped by resource:
+
+| Call | What it does |
+| --- | --- |
+| `sendhiiv.messages.send(params, options?)` | Send email. Resolves with the queue confirmation, including one id per recipient. |
+| `sendhiiv.messages.get(id)` | Look a message up by that id — current status, opens, clicks, bounce reason. |
+| `sendhiiv.suppressions.list(params?)` | Addresses you will not send to again. |
+| `sendhiiv.suppressions.add({ email, reason, details })` | Suppress one address. |
+| `sendhiiv.suppressions.remove(email)` | Remove a suppression you added. |
+| `sendhiiv.suppressions.import({ csv \| emails, reason })` | Bulk import, including exports from another provider. |
+
+Every one resolves with the parsed response or rejects with a `SendhiivError`.
 
 Both CommonJS (`require`) and ES modules (`import`) work, and TypeScript
 definitions ship with the package — `SendMessageParams`,
@@ -206,14 +213,127 @@ The API queues messages and answers `202 Accepted`. The resolved value:
   "code": "QUEUED_FOR_DELIVERY",
   "message": "1 email(s) queued for delivery",
   "total": 1,
+  "data": [{ "id": "msg_6ad2009154c402f10b8caf8e", "to": "jane@example.com" }],
   "retry": { "automatic": true, "retryable_temporary_failures": true }
+}
+```
+
+`data` holds one entry per recipient, in the order you listed them. **Store the
+`id`** — it is what every webhook event for that message carries as
+`message_id`, and what `messages.get()` takes:
+
+```js
+const { data } = await sendhiiv.messages.send({
+  to: ["jane@example.com", "john@example.com"],
+  subject: "Your receipt",
+  html: "<p>Thanks!</p>",
+});
+
+for (const message of data) {
+  await db.receipts.update(message.to, { messageId: message.id });
 }
 ```
 
 `total` is the number of recipients queued; `retry` describes server-side
 behavior (Sendhiiv retries temporary delivery failures itself after queueing).
-Queued means accepted for delivery, not delivered — delivery status shows up in
-your dashboard's activity log.
+Queued means accepted for delivery, not delivered.
+
+### Checking what happened to a message
+
+```js
+const { data } = await sendhiiv.messages.get("msg_6ad2009154c402f10b8caf8e");
+
+data.status; // queued | delivered | bounced | failed | suppressed | blocked
+data.reason; // why it bounced, failed or was suppressed
+data.opens;  // engagement counters, when tracking is on
+```
+
+Webhooks are the push version of this; use `messages.get()` to reconcile after
+a timeout, or when an event was missed.
+
+## Idempotency
+
+If a send is accepted but the response never reaches you — a timeout, a dropped
+connection — retrying blind would deliver the message twice. Pass an
+`idempotencyKey` and the retry is safe:
+
+```js
+await sendhiiv.messages.send(
+  { to: "jane@example.com", subject: "Your receipt", html: "<p>Thanks!</p>" },
+  { idempotencyKey: `receipt-${order.id}` },
+);
+```
+
+A retry with the same key returns the **original** response, with the same
+message ids, and sends nothing further. Keys are remembered for 24 hours, so
+derive them from something stable in your own system — an order id, an invoice
+number, a job id — rather than a fresh random value per attempt.
+
+Reusing a key with a different body throws a `SendhiivError` with code
+`IDEMPOTENCY_KEY_REUSED` (HTTP 422); that is a different message and needs its
+own key. A request that was *rejected* frees its key immediately, so you can fix
+the payload and retry with the same one.
+
+## Test mode
+
+A key beginning `sh_test_` runs every check a live send does — plan, required
+fields, template rendering, attachment limits, sender and domain resolution,
+your suppression list, content compliance — and then stops before delivery.
+
+```js
+const sendhiiv = new Sendhiiv(process.env.SENDHIIV_TEST_KEY); // sh_test_...
+
+const result = await sendhiiv.messages.send({
+  to: "anyone@example.com",
+  subject: "Rehearsal",
+  html: "<p>Nothing leaves the building.</p>",
+});
+
+result.mode;   // "test"
+result.status; // "accepted"
+result.data;   // real ids you can look up
+```
+
+Nothing is delivered, no quota is spent, and test sends stay out of your
+delivery statistics and sender reputation. Your webhooks still fire, with
+`"mode": "test"` in the payload, so a handler can be verified end to end.
+Create a test key from the dashboard by choosing the Test environment.
+
+## Suppressions
+
+The suppression list is the set of addresses Sendhiiv will not send to again.
+Hard bounces, spam complaints, unsubscribes and failed validations are added
+automatically and enforced on every send.
+
+```js
+// What is on the list
+const { data, total } = await sendhiiv.suppressions.list({
+  reason: "bounce",
+  limit: 100,
+});
+
+// Add one you learned about through your own channel
+await sendhiiv.suppressions.add({
+  email: "jane@example.com",
+  reason: "unsubscribe",
+  details: "Asked by reply",
+});
+
+// Move a list over from another provider
+await sendhiiv.suppressions.import({
+  reason: "bounce",
+  csv: fs.readFileSync("sendgrid-bounces.csv", "utf8"),
+});
+```
+
+`import()` reads provider export files directly, finding the email column by its
+header rather than its position. It returns how many were imported, how many
+were already listed, and a sample of any unusable rows. It never overwrites an
+existing entry, so it cannot downgrade a complaint already on file.
+
+Only entries added as `manual` or `invalid` can be removed — a hard bounce or a
+spam complaint is the receiving side's verdict, and removing it would knowingly
+damage your own deliverability.
 
 ## Error handling
 
@@ -262,8 +382,13 @@ try {
 The SDK retries **only** HTTP 429 responses (honoring `Retry-After`), because
 the rate limiter runs before anything is queued — a retry can never
 double-send. Network errors and 5xx responses are not retried automatically,
-since the message may already have been accepted. Sendhiiv itself retries
-temporary delivery failures server-side after a message is queued.
+since the message may already have been accepted.
+
+If you want those retried too, pass an `idempotencyKey` and retry them
+yourself: with a key, a repeated request returns the original response instead
+of sending again. Sendhiiv also retries temporary *delivery* failures
+server-side after a message is queued, which is a separate thing from retrying
+the API call.
 
 ```js
 const sendhiiv = new Sendhiiv({
