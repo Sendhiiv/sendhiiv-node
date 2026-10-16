@@ -10,7 +10,11 @@ let calls;
 function stubFetch(...responses) {
   let i = 0;
   global.fetch = async (url, init) => {
-    calls.push({ url, init, body: JSON.parse(init.body) });
+    calls.push({
+      url,
+      init,
+      body: init.body ? JSON.parse(init.body) : null,
+    });
     const r = responses[Math.min(i++, responses.length - 1)];
     if (r instanceof Error) throw r;
     return {
@@ -179,4 +183,107 @@ test("wraps network errors in SendhiivError with status 0", async () => {
       return true;
     },
   );
+});
+
+// ── Message ids ────────────────────────────────────────────────────────────
+
+const queuedWithIds = {
+  status: 202,
+  body: {
+    success: true,
+    status: "queued",
+    code: "QUEUED_FOR_DELIVERY",
+    total: 2,
+    data: [
+      { id: "msg_aaaaaaaaaaaaaaaaaaaaaaaa", to: "a@example.com" },
+      { id: "msg_bbbbbbbbbbbbbbbbbbbbbbbb", to: "b@example.com" },
+    ],
+  },
+};
+
+test("returns one message id per recipient", async () => {
+  stubFetch(queuedWithIds);
+  const client = new Sendhiiv("sh_live_test");
+  const result = await client.messages.send({
+    to: ["a@example.com", "b@example.com"],
+    subject: "Hi",
+    text: "Hi",
+  });
+
+  assert.deepEqual(
+    result.data.map((m) => m.id),
+    ["msg_aaaaaaaaaaaaaaaaaaaaaaaa", "msg_bbbbbbbbbbbbbbbbbbbbbbbb"],
+  );
+});
+
+// ── Idempotency ────────────────────────────────────────────────────────────
+
+test("sends Idempotency-Key only when one is given", async () => {
+  stubFetch(queued);
+  const client = new Sendhiiv("sh_live_test");
+
+  await client.messages.send(
+    { to: "a@example.com", subject: "Hi", text: "Hi" },
+    { idempotencyKey: "order-5521" },
+  );
+  assert.equal(calls[0].init.headers["Idempotency-Key"], "order-5521");
+
+  await client.messages.send({ to: "a@example.com", subject: "Hi", text: "Hi" });
+  assert.equal(calls[1].init.headers["Idempotency-Key"], undefined);
+});
+
+// ── Status lookup ──────────────────────────────────────────────────────────
+
+test("looks a message up by id without sending a body", async () => {
+  stubFetch({
+    status: 200,
+    body: { success: true, data: { id: "msg_abc", status: "delivered" } },
+  });
+  const client = new Sendhiiv("sh_live_test");
+  const result = await client.messages.get("msg_abc");
+
+  assert.equal(result.data.status, "delivered");
+  assert.equal(calls[0].init.method, "GET");
+  assert.equal(calls[0].url, "https://api.sendhiiv.com/api/v1/messages/msg_abc");
+  assert.equal(calls[0].init.body, undefined);
+  // A GET with a JSON content type confuses some proxies and gateways.
+  assert.equal(calls[0].init.headers["Content-Type"], undefined);
+});
+
+// ── Suppressions ───────────────────────────────────────────────────────────
+
+test("lists suppressions with query parameters", async () => {
+  stubFetch({ status: 200, body: { success: true, total: 0, data: [] } });
+  const client = new Sendhiiv("sh_live_test");
+  await client.suppressions.list({ reason: "bounce", limit: 50, page: undefined });
+
+  assert.equal(
+    calls[0].url,
+    "https://api.sendhiiv.com/api/v1/suppressions?reason=bounce&limit=50",
+  );
+});
+
+test("removes a suppression, escaping the address", async () => {
+  stubFetch({ status: 200, body: { success: true, removed: true } });
+  const client = new Sendhiiv("sh_live_test");
+  await client.suppressions.remove("jane+tag@example.com");
+
+  assert.equal(calls[0].init.method, "DELETE");
+  assert.equal(
+    calls[0].url,
+    "https://api.sendhiiv.com/api/v1/suppressions/jane%2Btag%40example.com",
+  );
+});
+
+test("imports a suppression list", async () => {
+  stubFetch({ status: 200, body: { success: true, imported: 2 } });
+  const client = new Sendhiiv("sh_live_test");
+  const result = await client.suppressions.import({
+    reason: "bounce",
+    csv: "email,created\nbob@acme.com,2024-01-02\n",
+  });
+
+  assert.equal(result.imported, 2);
+  assert.equal(calls[0].body.reason, "bounce");
+  assert.match(calls[0].body.csv, /bob@acme\.com/);
 });
