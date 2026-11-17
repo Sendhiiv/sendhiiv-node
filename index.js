@@ -48,6 +48,9 @@ const FIELD_MAP = {
   batchId: "batch_id",
   createdAfter: "created_after",
   createdBefore: "created_before",
+  appName: "app_name",
+  codeLength: "code_length",
+  expiresInMinutes: "expires_in_minutes",
 };
 
 function toWirePayload(message) {
@@ -172,6 +175,49 @@ class Sendhiiv {
 
       /** Balance, price per page on your tier, and today's daily limit. */
       balance: () => this.#request("GET", "/sms/balance", { retrySafe: true }),
+    };
+
+    this.verify = {
+      /**
+       * Text a one-time code to a number. Sendhiiv creates, expires and
+       * checks it; you never see or store the code.
+       *
+       *   const { data } = await sendhiiv.verify.send({ to: "08031234567", appName: "Lagos Bloom" });
+       *   // keep data.id, or check by number later
+       *
+       * Like sms.send, it always carries an idempotency key, so retries
+       * never send a second code.
+       */
+      send: (params, options = {}) =>
+        this.#request("POST", "/verify", {
+          body: params,
+          headers: {
+            "Idempotency-Key": String(options.idempotencyKey ?? `sdk_${randomUUID()}`),
+          },
+          retrySafe: true,
+        }),
+
+      /**
+       * Is this the code the user typed? Pass `id` from send(), or `to`.
+       * `data.valid` is true only the first time the right code is given;
+       * `data.result` says why not: "incorrect", "expired", "max_attempts",
+       * "canceled" or "already_approved".
+       *
+       *   const { data } = await sendhiiv.verify.check({ id, code: req.body.code });
+       *   if (!data.valid) return res.status(401).send("Wrong or expired code");
+       *
+       * Not retried on network errors: a retried check would use up an
+       * attempt, so retry it yourself if you want to.
+       */
+      check: (params) => this.#request("POST", "/verify/check", { body: params }),
+
+      /** Where a verification stands, by the `vrf_…` id. */
+      get: (id) =>
+        this.#request("GET", `/verify/${encodeURIComponent(id)}`, { retrySafe: true }),
+
+      /** Stop a pending code being used, e.g. when the user cancels sign-in. */
+      cancel: (id) =>
+        this.#request("POST", `/verify/${encodeURIComponent(id)}/cancel`, { retrySafe: true }),
     };
 
     this.suppressions = {

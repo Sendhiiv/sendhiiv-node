@@ -24,7 +24,9 @@
     "mail",
     "sms",
     "bulk-sms",
-    "nigeria"
+    "nigeria",
+    "otp",
+    "verification"
   ],
   "author": "Sendhiiv <support@sendhiiv.com>",
   "license": "MIT",

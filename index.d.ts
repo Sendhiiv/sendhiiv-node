@@ -288,6 +288,65 @@ export interface SmsBalance {
   daily_limit: { pages: number; used_pages: number; remaining_pages: number } | null;
 }
 
+// ── Verify (OTP) ────────────────────────────────────────────────────────────
+
+export interface StartVerificationParams {
+  /** The phone number to text the code to. */
+  to: string;
+  /** Shown in the SMS: "418302 is your Lagos Bloom verification code…". Up to 30 characters. */
+  appName?: string;
+  /** 4–8 digits. Default 6. */
+  codeLength?: number;
+  /** 1–30. Default 10. */
+  expiresInMinutes?: number;
+  /** Your own text. Must include {code}; may use {minutes} and {app_name}. */
+  message?: string;
+  reference?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export type VerificationStatus = "pending" | "approved" | "expired" | "max_attempts" | "canceled";
+
+export interface Verification {
+  id: string;
+  object: "verification";
+  to: string;
+  status: VerificationStatus;
+  attempts: number;
+  attempts_remaining: number;
+  expires_at: string;
+  approved_at: string | null;
+  /** The SMS that carried the code; null in test mode. */
+  sms: { id: string; status: SmsStatus; error: string | null } | null;
+  cost: Money;
+  reference: string | null;
+  metadata: Record<string, unknown> | null;
+  test: boolean;
+  created_at: string;
+}
+
+export interface CheckVerificationParams {
+  /** The vrf_… id from verify.send(). Or pass `to` instead. */
+  id?: string;
+  to?: string;
+  /** What the user typed. */
+  code: string;
+}
+
+export type VerificationResult =
+  | "approved"
+  | "incorrect"
+  | "expired"
+  | "max_attempts"
+  | "canceled"
+  | "already_approved";
+
+export interface VerificationCheck extends Verification {
+  /** True only the first time the right code is given. */
+  valid: boolean;
+  result: VerificationResult;
+}
+
 export declare class SendhiivError extends Error {
   name: "SendhiivError";
   /** HTTP status (0 for network/timeout errors). */
@@ -324,6 +383,12 @@ export declare class Sendhiiv {
     /** Every matching SMS, fetching pages as you go. */
     listAll(params?: SmsListParams): AsyncGenerator<Sms, void, unknown>;
     balance(): Promise<{ success: true; data: SmsBalance }>;
+  };
+  verify: {
+    send(params: StartVerificationParams, options?: SmsSendOptions): Promise<{ success: true; data: Verification }>;
+    check(params: CheckVerificationParams): Promise<{ success: true; data: VerificationCheck }>;
+    get(id: string): Promise<{ success: true; data: Verification }>;
+    cancel(id: string): Promise<{ success: true; data: Verification }>;
   };
   suppressions: {
     list(params?: SuppressionListParams): Promise<SuppressionListResponse>;

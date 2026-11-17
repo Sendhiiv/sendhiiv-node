@@ -351,6 +351,47 @@ wallet.tier.price_per_page.transactional;    // { amount: 750, currency: "NGN" }
 
 **Errors** have a stable `err.code`: `SMS_INSUFFICIENT_BALANCE` (402, with `err.body.short_by`), `SMS_INVALID_RECIPIENTS`, `SMS_MESSAGE_TOO_LONG`, `SMS_SENDER_ID_NOT_APPROVED`, `SMS_DAILY_LIMIT`, `SMS_NOT_ENABLED`, `SMS_API_NOT_ON_TIER`, `RATE_LIMITED`.
 
+## Verify (one-time codes)
+
+Send a login or confirmation code by SMS and check what the user types. Sendhiiv creates the code, texts it, expires it and checks it, so you never generate or store codes yourself.
+
+```js
+// 1. Text a code to the user
+const { data } = await sendhiiv.verify.send({ to: "08031234567", appName: "Lagos Bloom" });
+// SMS: "418302 is your Lagos Bloom verification code. It expires in 10 minutes. Don't share it with anyone."
+req.session.verificationId = data.id;   // vrf_…
+
+// 2. Check what they typed
+const { data: check } = await sendhiiv.verify.check({ id: req.session.verificationId, code: req.body.code });
+if (!check.valid) return res.status(401).json({ error: check.result });   // "incorrect", "expired", …
+// signed in
+```
+
+You can also check by number instead of keeping the id: `verify.check({ to: "08031234567", code })` checks the latest code sent to it.
+
+| Option | Notes |
+|---|---|
+| `to` | The phone number. |
+| `appName` | Shown in the SMS. Up to 30 characters. |
+| `codeLength` | 4–8 digits. Default 6. |
+| `expiresInMinutes` | 1–30. Default 10. |
+| `message` | Your own text. Must include `{code}`; may use `{minutes}` and `{app_name}`. |
+
+**`check.result`** is one of:
+
+| Result | Meaning |
+|---|---|
+| `approved` | Right code. `check.valid` is true. A code works once. |
+| `incorrect` | Wrong code. `check.attempts_remaining` says how many tries are left. |
+| `max_attempts` | 5 wrong tries: send a new code. |
+| `expired` | Too late: send a new code. |
+| `canceled` | A newer code was sent to this number, or it was cancelled. |
+| `already_approved` | This code was already used. |
+
+**Built-in protection.** Codes are stored only as a secure hash, so even Sendhiiv can't read them. Each code allows 5 tries, a new code replaces the old one, and a number can get at most 3 codes every 10 minutes, so nobody can use your sign-in form to drain your balance. Each code costs one transactional SMS.
+
+**Test mode.** With a `sh_test_` key nothing is sent or charged, and the code is always `000000`.
+
 ## Suppressions
 
 The suppression list is the set of addresses Sendhiiv will not send to again.
@@ -433,10 +474,12 @@ try {
 
 - **HTTP 429** is always retried (honoring `Retry-After`), because the rate
   limiter runs before anything is queued: a retry can never double-send.
-- **SMS sends and all reads** (`sms.*`, `messages.get`, `suppressions.list`)
+- **SMS sends, code sends and all reads** (`sms.*`, `verify.send`, `verify.get`, `messages.get`, `suppressions.list`)
   are also retried on timeouts, network errors and 5xx. SMS sends always
   carry an idempotency key, so a retry returns the original response instead
   of sending again.
+- **Code checks** (`verify.check`) are never retried automatically: each retry
+  would use up one of the user's attempts.
 - **Email sends** (`messages.send`) are not retried on network errors or 5xx,
   since the message may already have been accepted. To retry them, pass an
   `idempotencyKey` and retry yourself.
