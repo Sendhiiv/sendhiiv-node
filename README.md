@@ -299,6 +299,58 @@ delivery statistics and sender reputation. Your webhooks still fire, with
 `"mode": "test"` in the payload, so a handler can be verified end to end.
 Create a test key from the dashboard by choosing the Test environment.
 
+## SMS
+
+Send SMS to Nigerian numbers with the same API key. Each send is charged from your SMS balance at your tier's price per page.
+
+```js
+const { data } = await sendhiiv.sms.send({
+  to: ["08031234567", "+2349012345678"],   // one number or up to 1,000
+  message: "Your Lagos Bloom code is 418302",
+  reference: "order_4521",                  // optional: your own id
+});
+
+console.log(data.messages);   // [{ id: "sms_…", to: "+2348031234567", status: "queued", pages: 1 }, …]
+console.log(data.rejected);   // numbers that couldn't be used: not sent, not charged
+console.log(data.cost);       // { amount: 1500, currency: "NGN" } (kobo: ₦15.00)
+```
+
+| Field | Notes |
+|---|---|
+| `to` | One number or a list of up to 1,000. `08031234567`, `8031234567` and `+2348031234567` all work. |
+| `message` | Up to 6 pages. A page is 160 characters, or 70 if the message has emoji or ₦. |
+| `type` | `"transactional"` (default) for OTPs, alerts and receipts; it reaches numbers on the DND list. `"promotional"` is cheaper, doesn't reach DND numbers, and networks hold it outside 8am–8pm. |
+| `from` | An approved sender ID on your account. Leave it out to use the default. |
+| `reference`, `metadata` | Your own ids and data, returned with every message. |
+
+**Retries are safe.** Every `sms.send` carries an idempotency key, one is generated if you don't pass it, so the SDK retries timeouts and server errors without texting or charging anyone twice. Pass your own to make retries across restarts safe too: `sms.send(params, { idempotencyKey: order.id })`.
+
+**Check on a message, list them, see your balance:**
+
+```js
+const { data: sms } = await sendhiiv.sms.get("sms_6740a1b2c3d4e5f6a7b8c9d0");
+sms.status; // "queued" | "sent" | "delivered" | "failed" | "rejected"
+
+for await (const sms of sendhiiv.sms.listAll({ status: "failed", createdAfter: "2026-11-01" })) {
+  console.log(sms.to, sms.error);
+}
+
+const { data: wallet } = await sendhiiv.sms.balance();
+wallet.balance;                              // { amount: 4268000, currency: "NGN" }
+wallet.tier.price_per_page.transactional;    // { amount: 750, currency: "NGN" }
+```
+
+**Test mode.** With a `sh_test_` key, `sms.send` runs every check and returns the real price, but sends nothing and charges nothing. These numbers act out each outcome:
+
+| Number | Result |
+|---|---|
+| `08000000001` | delivered |
+| `08000000002` | failed |
+| `08000000003` | rejected (DND) |
+| anything else | delivered |
+
+**Errors** have a stable `err.code`: `SMS_INSUFFICIENT_BALANCE` (402, with `err.body.short_by`), `SMS_INVALID_RECIPIENTS`, `SMS_MESSAGE_TOO_LONG`, `SMS_SENDER_ID_NOT_APPROVED`, `SMS_DAILY_LIMIT`, `SMS_NOT_ENABLED`, `SMS_API_NOT_ON_TIER`, `RATE_LIMITED`.
+
 ## Suppressions
 
 The suppression list is the set of addresses Sendhiiv will not send to again.
@@ -379,22 +431,24 @@ try {
 
 ## Retries and timeouts
 
-The SDK retries **only** HTTP 429 responses (honoring `Retry-After`), because
-the rate limiter runs before anything is queued — a retry can never
-double-send. Network errors and 5xx responses are not retried automatically,
-since the message may already have been accepted.
+- **HTTP 429** is always retried (honoring `Retry-After`), because the rate
+  limiter runs before anything is queued: a retry can never double-send.
+- **SMS sends and all reads** (`sms.*`, `messages.get`, `suppressions.list`)
+  are also retried on timeouts, network errors and 5xx. SMS sends always
+  carry an idempotency key, so a retry returns the original response instead
+  of sending again.
+- **Email sends** (`messages.send`) are not retried on network errors or 5xx,
+  since the message may already have been accepted. To retry them, pass an
+  `idempotencyKey` and retry yourself.
 
-If you want those retried too, pass an `idempotencyKey` and retry them
-yourself: with a key, a repeated request returns the original response instead
-of sending again. Sendhiiv also retries temporary *delivery* failures
-server-side after a message is queued, which is a separate thing from retrying
-the API call.
+Sendhiiv also retries temporary *delivery* failures server-side after a
+message is queued, which is a separate thing from retrying the API call.
 
 ```js
 const sendhiiv = new Sendhiiv({
   apiKey: process.env.SENDHIIV_API_KEY,
   timeoutMs: 30000, // per-request timeout (default 30s)
-  maxRetries: 2,    // 429 retries (default 2)
+  maxRetries: 2,    // retries per request (default 2)
 });
 ```
 
