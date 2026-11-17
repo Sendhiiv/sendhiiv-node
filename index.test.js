@@ -287,3 +287,101 @@ test("imports a suppression list", async () => {
   assert.equal(calls[0].body.reason, "bounce");
   assert.match(calls[0].body.csv, /bob@acme\.com/);
 });
+
+// ── SMS ─────────────────────────────────────────────────────────────────────
+
+const smsAccepted = {
+  status: 202,
+  body: {
+    success: true,
+    data: {
+      object: "sms_batch",
+      batch_id: "smsb_1",
+      messages: [{ id: "sms_6740a1b2c3d4e5f6a7b8c9d0", to: "+2348031234567", status: "queued", pages: 1 }],
+      rejected: [],
+      cost: { amount: 750, currency: "NGN" },
+    },
+  },
+};
+
+test("sms.send posts to /sms/messages with a generated idempotency key", async () => {
+  stubFetch(smsAccepted);
+  const client = new Sendhiiv("sh_live_test");
+  const result = await client.sms.send({ to: "08031234567", message: "Your code is 418302" });
+  assert.equal(result.data.batch_id, "smsb_1");
+  assert.equal(calls[0].url, "https://api.sendhiiv.com/api/v1/sms/messages");
+  assert.equal(calls[0].init.method, "POST");
+  assert.deepEqual(calls[0].body, { to: "08031234567", message: "Your code is 418302" });
+  assert.match(calls[0].init.headers["Idempotency-Key"], /^sdk_[0-9a-f-]{36}$/);
+});
+
+test("sms.send uses your idempotency key when given", async () => {
+  stubFetch(smsAccepted);
+  const client = new Sendhiiv("sh_live_test");
+  await client.sms.send({ to: "0803", message: "Hi" }, { idempotencyKey: "order-4521" });
+  assert.equal(calls[0].init.headers["Idempotency-Key"], "order-4521");
+});
+
+test("sms.send retries a server error with the same key, so nothing sends twice", async () => {
+  stubFetch({ status: 503, body: { success: false, code: "SMS_UNAVAILABLE", error: "x" } }, smsAccepted);
+  const client = new Sendhiiv({ apiKey: "sh_live_test", maxRetries: 1 });
+  const started = Date.now();
+  const result = await client.sms.send({ to: "0803", message: "Hi" });
+  assert.equal(result.data.batch_id, "smsb_1");
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].init.headers["Idempotency-Key"], calls[1].init.headers["Idempotency-Key"]);
+  assert.ok(Date.now() - started >= 900, "backs off before retrying");
+});
+
+test("sms.send retries a network error too", async () => {
+  stubFetch(new TypeError("fetch failed"), smsAccepted);
+  const client = new Sendhiiv({ apiKey: "sh_live_test", maxRetries: 1 });
+  const result = await client.sms.send({ to: "0803", message: "Hi" });
+  assert.equal(result.data.batch_id, "smsb_1");
+  assert.equal(calls.length, 2);
+});
+
+test("email sends still don't retry server errors", async () => {
+  stubFetch({ status: 503, body: { success: false, error: "down" } }, queued);
+  const client = new Sendhiiv({ apiKey: "sh_live_test", maxRetries: 2 });
+  await assert.rejects(client.messages.send({ to: "a@example.com", subject: "x", html: "x" }), SendhiivError);
+  assert.equal(calls.length, 1);
+});
+
+test("a low balance surfaces as a SendhiivError with the shortfall", async () => {
+  stubFetch({
+    status: 402,
+    body: { success: false, code: "SMS_INSUFFICIENT_BALANCE", error: "Your SMS balance is too low for this send.", short_by: { amount: 650, currency: "NGN" } },
+  });
+  const client = new Sendhiiv("sh_live_test");
+  await assert.rejects(client.sms.send({ to: "0803", message: "Hi" }), (err) => {
+    assert.equal(err.status, 402);
+    assert.equal(err.code, "SMS_INSUFFICIENT_BALANCE");
+    assert.equal(err.body.short_by.amount, 650);
+    return true;
+  });
+});
+
+test("sms.get, sms.list filters and sms.balance hit the right paths", async () => {
+  stubFetch({ status: 200, body: { success: true, data: {} } });
+  const client = new Sendhiiv("sh_live_test");
+  await client.sms.get("sms_6740a1b2c3d4e5f6a7b8c9d0");
+  await client.sms.list({ status: "failed", batchId: "smsb_1", createdAfter: "2026-11-01" });
+  await client.sms.balance();
+  assert.equal(calls[0].url, "https://api.sendhiiv.com/api/v1/sms/messages/sms_6740a1b2c3d4e5f6a7b8c9d0");
+  assert.equal(calls[1].url, "https://api.sendhiiv.com/api/v1/sms/messages?status=failed&batch_id=smsb_1&created_after=2026-11-01");
+  assert.equal(calls[2].url, "https://api.sendhiiv.com/api/v1/sms/balance");
+});
+
+test("sms.listAll walks every page", async () => {
+  stubFetch(
+    { status: 200, body: { success: true, data: [{ id: "sms_a" }, { id: "sms_b" }], has_more: true, next_cursor: "sms_b" } },
+    { status: 200, body: { success: true, data: [{ id: "sms_c" }], has_more: false, next_cursor: null } },
+  );
+  const client = new Sendhiiv("sh_live_test");
+  const { listAll } = client.sms; // safe to destructure
+  const ids = [];
+  for await (const sms of listAll({ status: "delivered" })) ids.push(sms.id);
+  assert.deepEqual(ids, ["sms_a", "sms_b", "sms_c"]);
+  assert.match(calls[1].url, /cursor=sms_b/);
+});

@@ -15,9 +15,12 @@
  *   });
  */
 
+const { randomUUID } = require("node:crypto");
+
+const VERSION = "0.3.0";
 const DEFAULT_BASE_URL = "https://api.sendhiiv.com/api/v1";
 const DEFAULT_TIMEOUT_MS = 30_000;
-const DEFAULT_MAX_RETRIES = 2; // 429 rate-limit retries only — see below
+const DEFAULT_MAX_RETRIES = 2; // see #request for what is retried
 
 /** Error thrown for any non-2xx API response. */
 class SendhiivError extends Error {
@@ -42,6 +45,9 @@ const FIELD_MAP = {
   sendMode: "send_mode",
   batchSize: "batch_size",
   batchIntervalMinutes: "batch_interval_minutes",
+  batchId: "batch_id",
+  createdAfter: "created_after",
+  createdBefore: "created_before",
 };
 
 function toWirePayload(message) {
@@ -67,6 +73,17 @@ function retryDelayMs(response, attempt) {
   const seconds = Number(retryAfter);
   if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
   return Math.min(1000 * 2 ** attempt, 10_000);
+}
+
+// Walk a cursor-paged list endpoint, yielding items one by one.
+async function* paginate(fetchPage, params) {
+  let cursor = params.cursor;
+  for (;;) {
+    const page = await fetchPage({ ...params, cursor });
+    for (const item of page.data || []) yield item;
+    if (!page.has_more || !page.next_cursor) return;
+    cursor = page.next_cursor;
+  }
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -111,12 +128,55 @@ class Sendhiiv {
        * Use this to reconcile after a timeout or a missed webhook.
        */
       get: (id) =>
-        this.#request("GET", `/messages/${encodeURIComponent(id)}`),
+        this.#request("GET", `/messages/${encodeURIComponent(id)}`, { retrySafe: true }),
+    };
+
+    this.sms = {
+      /**
+       * Send one SMS to 1–1,000 numbers. Charged from your SMS balance;
+       * numbers that can't be used come back in `data.rejected`, uncharged.
+       *
+       *   await sendhiiv.sms.send({ to: "08031234567", message: "Your code is 418302" });
+       *
+       * Every send carries an idempotency key (one is generated if you don't
+       * pass `idempotencyKey`), so the SDK can safely retry a timeout or a
+       * server error without texting, or charging, anyone twice. Pass your
+       * own, such as an order id, to make retries across restarts safe too.
+       */
+      send: (message, options = {}) =>
+        this.#request("POST", "/sms/messages", {
+          body: message,
+          headers: {
+            "Idempotency-Key": String(options.idempotencyKey ?? `sdk_${randomUUID()}`),
+          },
+          retrySafe: true,
+        }),
+
+      /** One SMS by the `sms_…` id returned when it was sent. */
+      get: (id) =>
+        this.#request("GET", `/sms/messages/${encodeURIComponent(id)}`, { retrySafe: true }),
+
+      /**
+       * One page of SMS, newest first. Filter by status, reference, batchId,
+       * to, createdAfter, createdBefore; page with `cursor`.
+       */
+      list: (params = {}) =>
+        this.#request("GET", "/sms/messages", { params: toWirePayload(params), retrySafe: true }),
+
+      /**
+       * Every SMS matching the filters, fetching pages as you go.
+       *
+       *   for await (const sms of sendhiiv.sms.listAll({ status: "failed" })) { … }
+       */
+      listAll: (params = {}) => paginate((p) => this.sms.list(p), params),
+
+      /** Balance, price per page on your tier, and today's daily limit. */
+      balance: () => this.#request("GET", "/sms/balance", { retrySafe: true }),
     };
 
     this.suppressions = {
       /** Addresses this account will not send to. */
-      list: (params = {}) => this.#request("GET", "/suppressions", { params }),
+      list: (params = {}) => this.#request("GET", "/suppressions", { params, retrySafe: true }),
 
       /** Suppress one address. */
       add: (suppression) =>
@@ -143,7 +203,7 @@ class Sendhiiv {
   }
 
   async #request(method, path, options = {}) {
-    const { body, headers: extraHeaders, params } = options;
+    const { body, headers: extraHeaders, params, retrySafe = false } = options;
     const hasBody = body !== undefined;
     const payload = hasBody ? toWirePayload(body) : null;
     const query = params
@@ -157,11 +217,14 @@ class Sendhiiv {
       : "";
     const url = this.baseUrl + path + (query ? `?${query}` : "");
 
-    // Only 429 (rate limit) is retried: the limiter runs before anything is
-    // queued, so a retry can never double-send. 5xx and network errors are
-    // NOT retried automatically — the message may already have been accepted.
-    // Retry those yourself if you passed an idempotencyKey, which makes the
-    // retry return the original response instead of sending again.
+    // 429 (rate limit) is always retried: the limiter runs before anything is
+    // queued, so a retry can never double-send.
+    //
+    // Timeouts, network errors and 5xx are retried only when the request is
+    // `retrySafe`: reads, and SMS sends (which always carry an idempotency
+    // key, so a retry returns the original response). Email sends aren't
+    // retried on these, because the message may already have been accepted;
+    // retry those yourself with an idempotencyKey.
     for (let attempt = 0; ; attempt++) {
       let response;
       const controller = new AbortController();
@@ -171,7 +234,7 @@ class Sendhiiv {
           method,
           headers: {
             Authorization: `Bearer ${this.apiKey}`,
-            "User-Agent": "sendhiiv-node/0.2.0",
+            "User-Agent": `sendhiiv-node/${VERSION}`,
             ...(hasBody ? { "Content-Type": "application/json" } : {}),
             ...(extraHeaders || {}),
           },
@@ -179,6 +242,10 @@ class Sendhiiv {
           signal: controller.signal,
         });
       } catch (err) {
+        if (retrySafe && attempt < this.maxRetries) {
+          await sleep(retryDelayMs(null, attempt));
+          continue;
+        }
         throw new SendhiivError(
           err?.name === "AbortError"
             ? `Request timed out after ${this.timeoutMs}ms`
@@ -198,7 +265,8 @@ class Sendhiiv {
 
       if (response.ok) return body;
 
-      if (response.status === 429 && attempt < this.maxRetries) {
+      const retryable = response.status === 429 || (retrySafe && response.status >= 500);
+      if (retryable && attempt < this.maxRetries) {
         await sleep(retryDelayMs(response, attempt));
         continue;
       }
@@ -211,5 +279,5 @@ class Sendhiiv {
   }
 }
 
-module.exports = { Sendhiiv, SendhiivError };
+module.exports = { Sendhiiv, SendhiivError, VERSION };
 module.exports.default = Sendhiiv;

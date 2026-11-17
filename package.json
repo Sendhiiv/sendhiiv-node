@@ -1,7 +1,7 @@
 {
   "name": "sendhiiv",
-  "version": "0.2.0",
-  "description": "Official Node.js SDK for the Sendhiiv email API — send transactional email with one call.",
+  "version": "0.3.0",
+  "description": "Official Node.js SDK for the Sendhiiv API — send transactional email and SMS with one call.",
   "main": "index.js",
   "types": "index.d.ts",
   "files": [
@@ -21,7 +21,10 @@
     "transactional",
     "smtp",
     "api",
-    "mail"
+    "mail",
+    "sms",
+    "bulk-sms",
+    "nigeria"
   ],
   "author": "Sendhiiv <support@sendhiiv.com>",
   "license": "MIT",
