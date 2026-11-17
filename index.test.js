@@ -385,3 +385,33 @@ test("sms.listAll walks every page", async () => {
   assert.deepEqual(ids, ["sms_a", "sms_b", "sms_c"]);
   assert.match(calls[1].url, /cursor=sms_b/);
 });
+
+// ── Verify ──────────────────────────────────────────────────────────────────
+
+test("verify.send posts snake_case fields with an idempotency key", async () => {
+  stubFetch({ status: 202, body: { success: true, data: { id: "vrf_1", status: "pending" } } });
+  const client = new Sendhiiv("sh_live_test");
+  const { data } = await client.verify.send({ to: "08031234567", appName: "Lagos Bloom", codeLength: 4, expiresInMinutes: 5 });
+  assert.equal(data.id, "vrf_1");
+  assert.equal(calls[0].url, "https://api.sendhiiv.com/api/v1/verify");
+  assert.deepEqual(calls[0].body, { to: "08031234567", app_name: "Lagos Bloom", code_length: 4, expires_in_minutes: 5 });
+  assert.match(calls[0].init.headers["Idempotency-Key"], /^sdk_/);
+});
+
+test("verify.check returns valid/result and is never retried automatically", async () => {
+  stubFetch({ status: 503, body: { success: false, error: "down" } }, { status: 200, body: { success: true, data: { valid: true } } });
+  const client = new Sendhiiv({ apiKey: "sh_live_test", maxRetries: 2 });
+  await assert.rejects(client.verify.check({ id: "vrf_1", code: "418302" }), SendhiivError);
+  assert.equal(calls.length, 1, "a retried check would use up an attempt");
+  assert.deepEqual(calls[0].body, { id: "vrf_1", code: "418302" });
+});
+
+test("verify.get and verify.cancel hit the right paths", async () => {
+  stubFetch({ status: 200, body: { success: true, data: { status: "canceled" } } });
+  const client = new Sendhiiv("sh_live_test");
+  await client.verify.get("vrf_1");
+  await client.verify.cancel("vrf_1");
+  assert.equal(calls[0].url, "https://api.sendhiiv.com/api/v1/verify/vrf_1");
+  assert.equal(calls[1].init.method, "POST");
+  assert.equal(calls[1].url, "https://api.sendhiiv.com/api/v1/verify/vrf_1/cancel");
+});
